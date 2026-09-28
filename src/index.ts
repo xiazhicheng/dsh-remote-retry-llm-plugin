@@ -503,6 +503,9 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
 
     // The whole retry chain shares one id, so the UI card updates in place and
     // shows the live attempt count (retry N/maxRetries) instead of N fresh cards.
+    // The read-then-write below is atomic (no await between them), so concurrent
+    // request-error events for the same (agent, turn, step, provider) serialise
+    // on the event loop and can never mint a second retryId for this chain.
     const retryId = prior?.retryId ?? randomUUID();
     perProvider.set(provider, { count: attempt, retryId });
     ctx.logger.info(
@@ -793,6 +796,17 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
     }
   });
 
+  // A step's retry chain lives in `states` while the step is open. Once the step
+  // ends, drop it so a later re-run of the same (turn, step) — e.g. a resumed
+  // session replaying a step id — starts a fresh chain (retry #1) instead of
+  // continuing the abandoned chain's attempt count and backoff position.
+  const disposeStepListener = ctx.on('step/end', (payload: never) => {
+    const { agent, turn, step } = payload as { agent?: object; turn?: number; step?: number };
+    if (!agent || typeof turn !== 'number' || typeof step !== 'number') return;
+    const st = states.get(agent);
+    if (st && st.turn === turn && st.step === step) states.delete(agent);
+  });
+
   // Agents created before this plugin activated never emit `agent/created`, so
   // register their tools now — otherwise the current session goes without SSH.
   try {
@@ -916,6 +930,7 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
     disposeListener();
     disposeAgentListener();
     disposeAgentDisposeListener();
+    disposeStepListener();
     for (const disposers of agentToolDisposers.values()) {
       for (const d of disposers) d();
     }

@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that provides **SSH remote development tools** (exec, read, write) and **boosts LLM retries** to 50+ for unstable endpoints.
+A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that provides **SSH remote development tools** (exec, read, write) and **boosts LLM retries** to 100+ for unstable endpoints.
 
 When your LLM is flaky — frequent `429`/`RATE_LIMIT`, `5xx`/`SERVER`, timeouts, empty responses — the built-in recovery ends the turn after just **5 retries**. This plugin installs an additional listener on the agent loop's `agent/request-error` recovery waterfall that retries up to **100 times** by default (the UI shows the live attempt count, e.g. `正在重试模型请求（3/100）`), or **forever** in `always` mode, stopping only on success, turn cancellation, or plugin disposal.
 
@@ -26,8 +26,8 @@ DSH executes provider retry policy on the `agent/request-error` waterfall — an
 
 This plugin adds a **second listener** on the same waterfall with its own, more aggressive policy:
 
-- **`always`** (default) — retry every eligible failure without an attempt limit.
-- **`normal`** — retry only `retryableCodes` up to `maxRetries` (default **50**).
+- **`normal`** (default) — retry only `retryableCodes` up to `maxRetries` (default **100**).
+- **`always`** — explicit opt-in; retry every eligible failure with no attempt limit.
 
 Both plugins cooperate by waterfall order: whichever owns a given retry returns `{ kind: 'retry' }`. This plugin keeps its own per-step retry count **in memory** (keyed by agent object identity + turn + step + provider) and registers **no session projection**, so it never conflicts with the built-in retry plugin's `llmRetry` projection. It respects the turn abort signal and disposes cleanly (aborts active waits, drains them), so it never blocks turn quiescence or plugin disposal.
 

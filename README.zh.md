@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件，提供 **SSH 远程开发工具**（exec/read/write）并**增强 LLM 重试**至 50+ 次。
+一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件，提供 **SSH 远程开发工具**（exec/read/write）并**增强 LLM 重试**至 100+ 次。
 
 当你的 LLM 不稳定——频繁 `429`/`RATE_LIMIT`、`5xx`/`SERVER`、超时、空响应——内置重试只重试 **5 次**就结束本轮。本插件在 agent loop 的 `agent/request-error` 恢复瀑布流上额外挂一个监听器，默认最多重试 **100 次**（界面实时显示第几次/共几次，如「正在重试模型请求（3/100）」），或在 `always` 模式下**无限重试**，只在成功、本轮取消或插件卸载时停止。
 
@@ -24,8 +24,8 @@ DSH 在 `agent/request-error` 瀑布流上执行 provider 重试策略——这�
 
 本插件在同一个瀑布流上再加**第二个监听器**，用更激进的自有策略：
 
-- **`always`**（默认）——对每个可重试失败无限重试。
-- **`normal`**——只重试 `retryableCodes`，最多 `maxRetries` 次（默认 **50**）。
+- **`normal`**（默认）——只重试 `retryableCodes`，最多 `maxRetries` 次（默认 **100**）。
+- **`always`**——显式开启：对每个可重试失败无限重试。
 
 两个插件按瀑布流顺序协作：谁拥有某次重试就返回 `{ kind: 'retry' }`。本插件用**内存中**的 per-step 计数（按 agent 对象身份 + turn + step + provider 作 key），**不注册 session projection**，因此绝不与内置重试插件的 `llmRetry` projection 冲突。它尊重本轮 abort signal，卸载时干净中止（abort 活跃等待并 drain），绝不阻塞本轮收尾或插件卸载。
 
