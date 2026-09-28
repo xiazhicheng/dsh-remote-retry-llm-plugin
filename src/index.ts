@@ -174,25 +174,35 @@ interface RequestErrorPayload {
 }
 
 // ── Lazy native/heavy imports ────────────────────────────────────────────────
-// ssh2 (native binding) and @deepseek-ai/dsh-tools are loaded on demand so a
-// resolution or load failure never blocks plugin activation or DSH startup:
-// the retry feature keeps working, SSH tools just report unavailable.
+// ssh2 (native binding) is loaded on demand (see ./ssh.js) so a resolution or
+// load failure never blocks plugin activation or DSH startup: the retry
+// feature keeps working, SSH tools just report unavailable.
 
-type DefineToolFn = (options: Record<string, unknown>) => { name: string; description: string; parameters: unknown; output: unknown; execute(args: unknown, exec: unknown): Promise<unknown> };
-let defineToolFn: DefineToolFn | null = null;
-let toolsFailed = false;
+// ── Tool definition (local, no @deepseek-ai/dsh-tools) ──────────────────────
+// The plugin used to import `defineTool` from @deepseek-ai/dsh-tools, but the
+// host resolves third-party plugins through the profile's node_modules, so the
+// plugin's own copy of that package shadowed the host's: the tool scheduler is
+// keyed by a module-level Symbol, which is per-copy, and once the host's code
+// touched the plugin's copy every tool execution died with
+// "Cannot read properties of undefined (reading 'prepare')".
+// The tools below declare plain JSON Schema directly, so the helper only has
+// to pass fields through — the host owns validation and scheduling.
 
-async function loadDefineTool(): Promise<DefineToolFn | null> {
-  if (defineToolFn) return defineToolFn;
-  if (toolsFailed) return null;
-  try {
-    const mod = await import('@deepseek-ai/dsh-tools');
-    defineToolFn = mod.defineTool as unknown as DefineToolFn;
-    return defineToolFn;
-  } catch {
-    toolsFailed = true;
-    return null;
-  }
+interface ToolDefinition {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  output: {
+    schema: Record<string, unknown>;
+    render: (args: unknown, value: unknown) => Array<{ type: 'text'; text: string }>;
+  };
+  /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
+  execute(args: any, exec: unknown): Promise<unknown>;
+  timeoutMs?: number;
+}
+
+function defineTool(options: ToolDefinition): ToolDefinition {
+  return options;
 }
 
 // ── Tool output helper ───────────────────────────────────────────────────────
@@ -551,11 +561,6 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
 
   async function registerSshTools(agent: AgentScope): Promise<void> {
     if (agentToolDisposers.has(agent)) return;
-    const defineTool = await loadDefineTool();
-    if (!defineTool) {
-      ctx.logger.warn('retry-llm-plugin: @deepseek-ai/dsh-tools unavailable, SSH tools disabled');
-      return;
-    }
     const targetParam = { type: 'string', description: '已保存的 SSH 目标 id 或名称；省略则用默认目标（再退回插件配置里的 ssh.*）。' };
     const disposers: Array<() => void> = [];
     try {
@@ -563,9 +568,14 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
         name: 'ssh-exec',
         description: 'Execute a shell command over SSH and return stdout, stderr, and exit code. Runs in the remote working directory of the selected target.',
         parameters: {
-          command: { type: 'string', required: true, description: 'Shell command to execute on the remote server.' },
-          timeoutMs: { type: 'number', description: 'Timeout in milliseconds. Defaults to 30000.' },
-          target: targetParam,
+          type: 'object',
+          properties: {
+            command: { type: 'string', description: 'Shell command to execute on the remote server.' },
+            timeoutMs: { type: 'number', description: 'Timeout in milliseconds. Defaults to 30000.' },
+            target: targetParam,
+          },
+          required: ['command'],
+          additionalProperties: false,
         },
         output: jsonOutput({ type: 'object', properties: { stdout: { type: 'string' }, stderr: { type: 'string' }, exitCode: { type: 'number' } } }),
         execute: (args: { command: string; timeoutMs?: number; target?: string }, exec: unknown) =>
@@ -576,8 +586,13 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
         name: 'ssh-read',
         description: 'Read a file over SSH (SFTP). Relative paths resolve against the target remote working directory.',
         parameters: {
-          path: { type: 'string', required: true, description: 'Remote file path to read.' },
-          target: targetParam,
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Remote file path to read.' },
+            target: targetParam,
+          },
+          required: ['path'],
+          additionalProperties: false,
         },
         output: jsonOutput({ type: 'object', properties: { content: { type: 'string' }, path: { type: 'string' } } }),
         execute: (args: { path: string; target?: string }, exec: unknown) =>
@@ -588,9 +603,14 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
         name: 'ssh-write',
         description: 'Write a file over SSH (SFTP). Relative paths resolve against the target remote working directory.',
         parameters: {
-          path: { type: 'string', required: true, description: 'Remote file path to write.' },
-          content: { type: 'string', required: true, description: 'Content to write to the file.' },
-          target: targetParam,
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Remote file path to write.' },
+            content: { type: 'string', description: 'Content to write to the file.' },
+            target: targetParam,
+          },
+          required: ['path', 'content'],
+          additionalProperties: false,
         },
         output: jsonOutput({ type: 'object', properties: { success: { type: 'boolean' }, path: { type: 'string' } } }),
         execute: (args: { path: string; content: string; target?: string }, exec: unknown) =>
@@ -601,17 +621,22 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
         name: 'ssh-targets',
         description: 'Manage saved SSH development targets (the "remote workspaces" configured on the settings page): list them, test connectivity, save or update one, remove one, or choose the default.',
         parameters: {
-          action: { type: 'string', required: true, enum: ['list', 'test', 'save', 'remove', 'default', 'reveal', 'listDir', 'prepareDir'], description: 'Operation to perform. reveal returns a saved password in plaintext; listDir browses a remote directory; prepareDir creates and binds the session workspace of one target.' },
-          path: { type: 'string', description: 'listDir: remote directory to list (empty starts at the target remote dir, then $HOME). prepareDir: local session workspace to create and bind (empty derives one from the target id).' },
-          target: { type: 'string', description: 'Target id or name: required for test/remove/default, optional for save (omit to create a new one).' },
-          name: { type: 'string', description: 'Display name (save).' },
-          host: { type: 'string', description: 'SSH hostname or IP (save).' },
-          port: { type: 'number', description: 'SSH port, default 22 (save).' },
-          username: { type: 'string', description: 'SSH username (save).' },
-          identityFile: { type: 'string', description: 'Private key path, ~ is expanded (save).' },
-          passwordEnv: { type: 'string', description: 'Credential reference (environment-variable name) for this target\'s password (save).' },
-          password: { type: 'string', description: 'Password for password auth: used by test, and stored in the DSH credential store on save (save/test).' },
-          remoteDir: { type: 'string', description: 'Remote working directory (save).' },
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'test', 'save', 'remove', 'default', 'reveal', 'listDir', 'prepareDir'], description: 'Operation to perform. reveal returns a saved password in plaintext; listDir browses a remote directory; prepareDir creates and binds the session workspace of one target.' },
+            path: { type: 'string', description: 'listDir: remote directory to list (empty starts at the target remote dir, then $HOME). prepareDir: local session workspace to create and bind (empty derives one from the target id).' },
+            target: { type: 'string', description: 'Target id or name: required for test/remove/default, optional for save (omit to create a new one).' },
+            name: { type: 'string', description: 'Display name (save).' },
+            host: { type: 'string', description: 'SSH hostname or IP (save).' },
+            port: { type: 'number', description: 'SSH port, default 22 (save).' },
+            username: { type: 'string', description: 'SSH username (save).' },
+            identityFile: { type: 'string', description: 'Private key path, ~ is expanded (save).' },
+            passwordEnv: { type: 'string', description: 'Credential reference (environment-variable name) for this target\'s password (save).' },
+            password: { type: 'string', description: 'Password for password auth: used by test, and stored in the DSH credential store on save (save/test).' },
+            remoteDir: { type: 'string', description: 'Remote working directory (save).' },
+          },
+          required: ['action'],
+          additionalProperties: false,
         },
         output: jsonOutput({ type: 'object', properties: { ok: { type: 'boolean' }, message: { type: 'string' } } }),
         execute: async (args: Record<string, unknown>) => {
