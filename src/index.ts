@@ -78,8 +78,8 @@ export interface ConfigSchema {
 }
 
 export const Config = z.object({
-  mode: z.string().default('always'),
-  maxRetries: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(50),
+  mode: z.string().default('normal'),
+  maxRetries: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(100),
   retryableCodes: z.array(z.string()).default([...DEFAULT_RETRYABLE_CODES]),
   excludeCodes: z.array(z.string()).default([...DEFAULT_EXCLUDE_CODES]),
   backoff: z.object({
@@ -113,8 +113,8 @@ function resolveConfig(config?: ConfigSchema): ResolvedConfig {
   const b = config?.backoff ?? {};
   const s = config?.ssh ?? {};
   return {
-    mode: config?.mode === 'normal' ? 'normal' : 'always',
-    maxRetries: typeof config?.maxRetries === 'number' ? config.maxRetries : 50,
+    mode: config?.mode === 'always' ? 'always' : 'normal',
+    maxRetries: typeof config?.maxRetries === 'number' ? config.maxRetries : 100,
     retryableCodes: config?.retryableCodes ?? DEFAULT_RETRYABLE_CODES,
     excludeCodes: config?.excludeCodes ?? DEFAULT_EXCLUDE_CODES,
     respectProviderRetryAfter: config?.respectProviderRetryAfter !== false,
@@ -288,7 +288,8 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
   const random = Math.random;
   const lifetime = new AbortController();
   const active = new Set<Promise<unknown>>();
-  const states = new WeakMap<object, { turn: number; step: number; counts: Map<string, number> }>();
+  interface PerProviderRetryState { count: number; retryId: string }
+  const states = new WeakMap<object, { turn: number; step: number; perProvider: Map<string, PerProviderRetryState> }>();
 
   // ── Credentials (SSH passwords live in DSH's credential store) ──────────
 
@@ -461,13 +462,13 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
 
   // ── Retry listener ───────────────────────────────────────────────────────
 
-  function stepCounts(agent: object, turn: number, step: number): Map<string, number> {
+  function stepRetryState(agent: object, turn: number, step: number): Map<string, PerProviderRetryState> {
     let st = states.get(agent);
     if (!st || st.turn !== turn || st.step !== step) {
-      st = { turn, step, counts: new Map() };
+      st = { turn, step, perProvider: new Map() };
       states.set(agent, st);
     }
-    return st.counts;
+    return st.perProvider;
   }
 
   function decidesRetry(code: string): boolean {
@@ -482,8 +483,9 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
     if (fused.aborted) return next();
     if (!decidesRetry(failure.code)) return next();
 
-    const counts = stepCounts(agent, turn, step);
-    const attempt = (counts.get(provider) ?? 0) + 1;
+    const perProvider = stepRetryState(agent, turn, step);
+    const prior = perProvider.get(provider);
+    const attempt = (prior?.count ?? 0) + 1;
     if (resolved.mode === 'normal' && attempt > resolved.maxRetries) return next();
 
     let delayMs: number;
@@ -499,17 +501,21 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
       delayMs = localDelay(resolved.backoff, attempt, random);
     }
 
-    counts.set(provider, attempt);
+    // The whole retry chain shares one id, so the UI card updates in place and
+    // shows the live attempt count (retry N/maxRetries) instead of N fresh cards.
+    const retryId = prior?.retryId ?? randomUUID();
+    perProvider.set(provider, { count: attempt, retryId });
     ctx.logger.info(
       'retry-llm-plugin: provider "%s" %s retry #%d after %dms (code %s)',
       provider, resolved.mode, attempt, Math.round(delayMs), failure.code,
     );
 
-    const retryId = randomUUID();
     try {
       agent.session.append('llm/retry', {
         retryId, turn, step, provider,
-        mode: resolved.mode, policyKey: 'retryBoost', retry: attempt, delayMs, failure,
+        mode: resolved.mode, policyKey: 'retryBoost', retry: attempt,
+        ...(resolved.mode === 'normal' ? { maxRetries: resolved.maxRetries } : {}),
+        delayMs, failure,
       });
     } catch (e) {
       ctx.logger.warn('retry-llm-plugin: failed to append llm/retry event: %o', e);

@@ -4,7 +4,7 @@
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件，提供 **SSH 远程开发工具**（exec/read/write）并**增强 LLM 重试**至 50+ 次。
 
-当你的 LLM 不稳定——频繁 `429`/`RATE_LIMIT`、`5xx`/`SERVER`、超时、空响应——内置重试只重试 **5 次**就结束本轮。本插件在 agent loop 的 `agent/request-error` 恢复瀑布流上额外挂一个监听器，默认重试 **50 次**，或在 `always` 模式下**无限重试**，只在成功、本轮取消或插件卸载时停止。
+当你的 LLM 不稳定——频繁 `429`/`RATE_LIMIT`、`5xx`/`SERVER`、超时、空响应——内置重试只重试 **5 次**就结束本轮。本插件在 agent loop 的 `agent/request-error` 恢复瀑布流上额外挂一个监听器，默认最多重试 **100 次**（界面实时显示第几次/共几次，如「正在重试模型请求（3/100）」），或在 `always` 模式下**无限重试**，只在成功、本轮取消或插件卸载时停止。
 
 > 用 TypeScript 编写。仅 Host 侧，无客户端/UI bundle。可与内置 `@deepseek-ai/dsh-llm-retry` 共存。
 
@@ -185,8 +185,8 @@ plugin_manager → install_bundle → target: /绝对路径/dsh-remote-retry-llm
 - id: retry-llm-plugin
   name: dsh-remote-retry-llm-plugin
   config:
-    mode: always                 # 'always'（默认，无限）| 'normal'（遵循 maxRetries）
-    maxRetries: 50               # normal 模式下首次请求之后的重试预算（默认 50）
+    mode: normal                 # 'normal'（默认，最多 maxRetries 次）| 'always'（无限）
+    maxRetries: 100              # 首次请求之后的重试预算（默认 100）
     retryableCodes:              # normal 模式可重试码（默认瞬态集合）
       - EMPTY_RESPONSE
       - RATE_LIMIT
@@ -241,8 +241,8 @@ bundle 自带的 [`cordis.patch.yml`](cordis.patch.yml) 里 `ssh.host` 是 `loca
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `mode` | `always` | 对每个可重试失败一直重试，直到成功/取消/卸载 |
-| `maxRetries` | `50` | 仅 normal 模式生效 |
+| `mode` | `normal` | 重试可重试失败最多 `maxRetries` 次；`always` 不设上限 |
+| `maxRetries` | `100` | 重试预算（默认） |
 | `retryableCodes` | `EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT` | normal 模式可重试集合 |
 | `excludeCodes` | `AUTH, MISSING_CREDENTIAL, NO_ADAPTER, INVALID_REQUEST, PROTOCOL, CONTEXT_OVERFLOW, IMAGE_OFFLOAD_REQUIRED, REGISTRATION_DISPOSED` | 永久失败 + 归其他恢复策略所有的码 |
 | `backoff.initialDelayMs` | `500` | |
@@ -277,7 +277,7 @@ bundle 自带的 [`cordis.patch.yml`](cordis.patch.yml) 里 `ssh.host` 是 `loca
 - name: '@deepseek-ai/dsh-llm-retry'
 ```
 
-当你想**无视各 provider 自有策略**统一增强重试，或想要比默认 5 更大的有限 50 次预算时，用本插件。
+当你想**无视各 provider 自有策略**统一增强重试，或想要比默认 5 更大的有限 100 次预算时，用本插件。
 
 ## 仓库结构
 

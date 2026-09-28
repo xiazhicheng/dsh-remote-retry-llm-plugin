@@ -5,8 +5,8 @@
     - id: retry-llm-plugin
       name: dsh-remote-retry-llm-plugin
       config:
-        mode: always
-        maxRetries: 50
+        mode: normal
+        maxRetries: 100
         backoff:
           initialDelayMs: 500
           maxDelayMs: 30000

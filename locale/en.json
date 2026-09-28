@@ -1,4 +1,4 @@
 {
   "title": "Remote SSH Workspaces + LLM Retry Boost",
-  "description": "SSH remote development (exec/read/write tools, targets configured and connection-tested on the settings page or straight from the add-workspace flow) plus boosted LLM retries on the agent/request-error recovery waterfall."
+  "description": "SSH remote development (exec/read/write tools, targets configured and connection-tested on the settings page or straight from the add-workspace flow) plus boosted LLM retries (up to 100 by default with a live attempt count) on the agent/request-error recovery waterfall."
 }

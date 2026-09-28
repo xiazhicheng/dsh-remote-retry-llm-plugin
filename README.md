@@ -4,7 +4,7 @@ English | [中文](README.zh.md)
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that provides **SSH remote development tools** (exec, read, write) and **boosts LLM retries** to 50+ for unstable endpoints.
 
-When your LLM is flaky — frequent `429`/`RATE_LIMIT`, `5xx`/`SERVER`, timeouts, empty responses — the built-in recovery ends the turn after just **5 retries**. This plugin installs an additional listener on the agent loop's `agent/request-error` recovery waterfall that retries **50 times** by default, or **forever** in `always` mode, stopping only on success, turn cancellation, or plugin disposal.
+When your LLM is flaky — frequent `429`/`RATE_LIMIT`, `5xx`/`SERVER`, timeouts, empty responses — the built-in recovery ends the turn after just **5 retries**. This plugin installs an additional listener on the agent loop's `agent/request-error` recovery waterfall that retries up to **100 times** by default (the UI shows the live attempt count, e.g. `正在重试模型请求（3/100）`), or **forever** in `always` mode, stopping only on success, turn cancellation, or plugin disposal.
 
 > Written in TypeScript. Host-only — no client/UI bundle. Safe to mount alongside the built-in `@deepseek-ai/dsh-llm-retry`.
 
@@ -183,8 +183,8 @@ The row ships with sensible defaults in [`cordis.patch.yml`](cordis.patch.yml). 
 - id: retry-llm-plugin
   name: dsh-remote-retry-llm-plugin
   config:
-    mode: always                 # 'always' (default, no limit) | 'normal' (honor maxRetries)
-    maxRetries: 50               # normal-mode budget after the first request (default 50)
+    mode: normal                 # 'normal' (default, up to maxRetries) | 'always' (no limit)
+    maxRetries: 100              # retry budget after the first request (default 100)
     retryableCodes:              # normal-mode eligible codes (default transient set)
       - EMPTY_RESPONSE
       - RATE_LIMIT
@@ -243,8 +243,8 @@ instead of copying it, so `ssh2` and `schemastery` resolve from that checkout's 
 
 | Option | Default | Notes |
 |---|---|---|
-| `mode` | `always` | Retry every eligible failure until success / cancel / dispose |
-| `maxRetries` | `50` | Used only in `normal` mode |
+| `mode` | `normal` | Retry eligible failures up to `maxRetries`; `always` retries without a limit |
+| `maxRetries` | `100` | Retry budget (default) |
 | `retryableCodes` | `EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT` | Normal-mode eligible set |
 | `excludeCodes` | `AUTH, MISSING_CREDENTIAL, NO_ADAPTER, INVALID_REQUEST, PROTOCOL, CONTEXT_OVERFLOW, IMAGE_OFFLOAD_REQUIRED, REGISTRATION_DISPOSED` | Permanent failures + codes owned by other recovery policies |
 | `backoff.initialDelayMs` | `500` | |
@@ -279,7 +279,7 @@ You can also get unlimited retries **without this plugin** by setting `retryPoli
 - name: '@deepseek-ai/dsh-llm-retry'
 ```
 
-Use this plugin when you want the boost **regardless of each provider's own policy**, or a finite 50-retry budget that's larger than the default 5.
+Use this plugin when you want the boost **regardless of each provider's own policy**, or a finite 100-retry budget that's larger than the default 5.
 
 ## Repository layout
 
