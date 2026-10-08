@@ -338,7 +338,7 @@ emits the same `lib/index.js` from `src/index.ts` using plain TypeScript.
 
 ## Compatibility
 
-Built and tested against DeepSeek Harness `0.1.7-rc.2` (Cordis `4.0.4`, schemastery `3.18.4`). Runtime dependencies: `ssh2` (SSH client), `@deepseek-ai/schemastery` (config schema), `@deepseek-ai/dsh-tools` (tool definitions). The DSH packages are also declared in `peerDependencies` pinned to the runtime line, so the plugin manager can reject a mismatched runtime instead of loading it. The remaining `@deepseek-ai/*` entries in `devDependencies` are for type-checking and building only.
+Built and tested against DeepSeek Harness `0.2.0-rc.2` (Cordis `4.0.4`, schemastery `3.18.4`). Runtime dependencies: `ssh2` (SSH client), `@deepseek-ai/schemastery` (config schema). The DSH packages (`@deepseek-ai/dsh-agent`, `@deepseek-ai/dsh-llm`) are also declared in `peerDependencies` pinned to the runtime line (`^0.2.0-rc.2`), so the plugin manager can reject a mismatched runtime instead of loading it. The remaining `@deepseek-ai/*` entries in `devDependencies` are for type-checking and building only.
 
 ## License
 

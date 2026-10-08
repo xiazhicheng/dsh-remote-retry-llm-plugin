@@ -821,15 +821,15 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
     }
   });
 
-  // A step's retry chain lives in `states` while the step is open. Once the step
-  // ends, drop it so a later re-run of the same (turn, step) — e.g. a resumed
-  // session replaying a step id — starts a fresh chain (retry #1) instead of
-  // continuing the abandoned chain's attempt count and backoff position.
-  const disposeStepListener = ctx.on('step/end', (payload: never) => {
-    const { agent, turn, step } = payload as { agent?: object; turn?: number; step?: number };
-    if (!agent || typeof turn !== 'number' || typeof step !== 'number') return;
-    const st = states.get(agent);
-    if (st && st.turn === turn && st.step === step) states.delete(agent);
+  // A step's retry chain lives in `states` while the step is open. DSH does not
+  // emit a Cordis `step/end` event (it is only a session-log event type), so the
+  // state is dropped when the agent returns to idle — every open retry chain is
+  // then finished (or aborted), and a later re-run of the same (turn, step) —
+  // e.g. a resumed session replaying a step id — starts a fresh chain (retry #1)
+  // instead of continuing the abandoned chain's attempt count and backoff.
+  const disposeStatusListener = ctx.on('agent/status', (payload: never) => {
+    const { agent, status } = payload as { agent?: object; status?: 'idle' | 'running' };
+    if (status === 'idle' && agent) states.delete(agent);
   });
 
   // Agents created before this plugin activated never emit `agent/created`, so
@@ -955,7 +955,7 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
     disposeListener();
     disposeAgentListener();
     disposeAgentDisposeListener();
-    disposeStepListener();
+    disposeStatusListener();
     for (const disposers of agentToolDisposers.values()) {
       for (const d of disposers) d();
     }

@@ -330,7 +330,7 @@ pnpm typecheck   # tsc --noEmit
 
 ## 兼容性
 
-基于 DeepSeek Harness `0.1.7-rc.2`（Cordis `4.0.4`、schemastery `3.18.4`）编写测试。运行时依赖：`ssh2`（SSH 客户端）、`@deepseek-ai/schemastery`（配置 schema）、`@deepseek-ai/dsh-tools`（工具定义）。DSH 相关包同时声明在 `peerDependencies` 并钉在对应运行时版本上，这样运行时版本不匹配时插件管理器会拒绝安装，而不是加载后出错。`devDependencies` 里其余的 `@deepseek-ai/*` 仅用于类型检查与构建。
+基于 DeepSeek Harness `0.2.0-rc.2`（Cordis `4.0.4`、schemastery `3.18.4`）编写测试。运行时依赖：`ssh2`（SSH 客户端）、`@deepseek-ai/schemastery`（配置 schema）。DSH 相关包（`@deepseek-ai/dsh-agent`、`@deepseek-ai/dsh-llm`）同时声明在 `peerDependencies` 并钉在对应运行时版本上（`^0.2.0-rc.2`），这样运行时版本不匹配时插件管理器会拒绝安装，而不是加载后出错。`devDependencies` 里其余的 `@deepseek-ai/*` 仅用于类型检查与构建。
 
 ## 许可
 

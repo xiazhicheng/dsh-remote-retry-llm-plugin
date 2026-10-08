@@ -64,15 +64,16 @@ window.__ModuleLoader__.load({
 		}
 
 		async function ensureRemoteWorkspace(sessionDir, name, host) {
-			const workspaceRemote = service("remote.workspace");
-			if (!workspaceRemote || typeof workspaceRemote.create !== "function") {
-				throw new Error("当前组装没有 workspace 远程命名空间，无法创建工作区");
+			const workspaces = service("workspaces");
+			if (!workspaces || typeof workspaces.create !== "function") {
+				throw new Error("当前组装没有 workspace 服务，无法创建工作区");
 			}
-			const created = unwrapRemote(await workspaceRemote.create({ path: sessionDir }));
+			const created = unwrapRemote(await workspaces.create({ path: sessionDir }));
 			const workspaceId = created && created.workspace ? created.workspace.workspaceId : (created ? created.workspaceId : undefined);
 			if (!workspaceId) throw new Error(`创建工作区没有返回 id（返回：${JSON.stringify(created)}）`);
 			try {
-				unwrapRemote(await workspaceRemote.rename({ workspaceId, title: `远程 · ${name || host} (${host})` }));
+				// 0.2.0 的 workspaces.rename 是 (workspaceId, title) 位置参数
+				unwrapRemote(await workspaces.rename(workspaceId, `远程 · ${name || host} (${host})`));
 			} catch { /* a duplicate title is fine: the path-derived one stays */ }
 			return workspaceId;
 		}
