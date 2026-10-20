@@ -70,6 +70,10 @@ The SSH connection is established lazily on first tool call and cached for the p
 
 `remoteDir` is the default remote working directory: `ssh-exec` runs commands as `cd '<remoteDir>' && <command>`, and `ssh-read`/`ssh-write` resolve relative paths against it (absolute paths and `~` are used as-is).
 
+### Cancellation
+
+Every tool body observes the caller-owned `exec.signal` DSH passes it. Pressing **stop/cancel** in the UI aborts an in-flight `ssh-exec` **immediately** instead of letting the remote command run on while the local call waits out `timeoutMs`: the plugin forwards `SIGTERM` to the remote command over the channel (RFC 4254 `signal`) and then closes the channel only — the pooled connection survives, so cancelling has no side effect on later calls to the same target. `ssh-read`/`ssh-write` end their own SFTP session instead.
+
 > The plugin talks SSH directly through `ssh2`, so it does **not** read `~/.ssh/config`. Put the host, port, username, and key in the plugin config instead; a `Host` alias from your ssh config will not resolve.
 
 ### Enabling the tools for the current agent
@@ -130,6 +134,8 @@ Every entry point lives in the **add-workspace flow** (there is no separate sett
    - **本地目录…** — the platform directory picker, exactly as shipped;
    - **远程工作区（N）…** — **lists every saved remote workspace** with `user@host:port`, **remote dir** and password state, each row offering **打开 / 编辑 / 删除 / 显示密码**. 打开 enters it: sets it as the default, creates the workspace titled `远程 · <name> (<host>)`, and selects it;
    - **取消**.
+
+   The dialog can always be dismissed with **取消**, `Esc`, or a click on the backdrop. Dismissing **aborts work still in flight** (for example pressing 打开 while the host is still preparing the session directory), so nothing creates or opens a workspace behind your back afterwards. The list keeps a permanent **取消** button, and an in-flight 打开 shows **打开中…** and is disabled so it cannot be submitted twice.
 2. The bottom of that list is **+ 新建远程工作区（SSH）…**: fill host / username / password / **remote dir** → test → **保存并打开**. Saving makes it the default, creates the same titled workspace, and **opens it right there**.
 3. Once a target is the **default**, just talk to the agent in any session ("check disk usage on /srv on the remote box", "restart nginx remotely") — `ssh-exec` / `ssh-read` / `ssh-write` act on that target, and `remoteDir` is the working directory for commands.
 4. For a different host, name it in the conversation (or let the agent pass the tool's `target` parameter).
@@ -298,7 +304,8 @@ dsh-remote-retry-llm-plugin/
 │   ├── en.json           # Plugin Manager display title + description (English)
 │   └── zh.json           # (中文)
 ├── scripts/
-│   └── copy-client.mjs   # Copies the hand-authored browser bundle into lib/
+│   ├── copy-client.mjs   # Copies the hand-authored browser bundle into lib/
+│   └── test-client-flow.mjs  # Headless regression test for the open/cancel flow (pnpm test:client)
 ├── src/
 │   ├── index.ts          # Host plugin entry (source of truth)
 │   ├── ssh.ts            # SSH transport source
@@ -322,6 +329,7 @@ pnpm install
 pnpm build        # tsdown: src/index.ts -> lib/index.js
 pnpm build:tsc    # tsc alternative: same output, no native bundler needed
 pnpm typecheck    # tsc --noEmit
+pnpm test:client  # headless regression test for the browser half's open/cancel flow
 ```
 
 `lib/` is committed so installations that skip the build still work. Rebuild after editing `src/`.

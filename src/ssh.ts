@@ -23,11 +23,60 @@ export interface SshStream {
   on(event: 'close', cb: (code: number) => void): void;
   on(event: 'error', cb: (error: Error) => void): void;
   stderr: { on(event: 'data', cb: (data: { toString(): string }) => void): void };
+  /** ssh2 ClientChannel: RFC 4254 "signal" request, forwards SIG* to the remote command. */
+  signal?(name: string): void;
+  /** ssh2 ClientChannel: closes the channel (the remote command gets SIGHUP). */
+  close?(): void;
 }
 
 export interface SftpLike {
   readFile(path: string, encoding: string, cb: (err: Error | undefined, content: Buffer | string) => void): void;
   writeFile(path: string, content: string, cb: (err: Error | undefined) => void): void;
+  /** ssh2 SFTP session: ends this session only, never the shared connection. */
+  end?(): void;
+}
+
+// ── Cooperative cancellation ─────────────────────────────────────────────────
+// DSH dispatches every tool body with the caller-owned `exec.signal` and expects
+// the body to observe it: a cancel must quiesce the body, not just abandon it.
+// The SSH calls below therefore stop their channel/SFTP session on abort, so
+// pressing 停止/取消 in the UI ends the remote command instead of leaving it to
+// run until its own timeout on the far side.
+
+/** An abort-shaped error (name `AbortError`) so callers can tell it from a transport failure. */
+export function abortError(message = 'ssh call cancelled'): Error {
+  const error = new Error(message);
+  error.name = 'AbortError';
+  return error;
+}
+
+export function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
+}
+
+/** Run `onAbort` when `signal` aborts; returns the disposer (no-op for no signal). */
+function listenAbort(signal: AbortSignal | undefined, onAbort: () => void): () => void {
+  if (!signal) return () => { /* nothing to detach */ };
+  if (signal.aborted) {
+    onAbort();
+    return () => { /* already fired */ };
+  }
+  signal.addEventListener('abort', onAbort, { once: true });
+  return () => signal.removeEventListener('abort', onAbort);
+}
+
+/**
+ * Await `promise` but reject as soon as `signal` aborts. The promise itself keeps
+ * running (a pooled SSH connection is shared, so one cancelled call must not tear
+ * it down for its siblings); only this caller stops waiting.
+ */
+export function awaitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const off = listenAbort(signal, () => reject(abortError()));
+    promise.then((value) => { off(); resolve(value); }, (error: unknown) => { off(); reject(error); });
+  });
 }
 
 export interface KeyboardInteractivePrompt {
@@ -118,8 +167,12 @@ export function connectOptions(cfg: SshConfig, password: string): Record<string,
   return options;
 }
 
-/** Open one SSH connection and resolve once the handshake reports `ready`. */
-export function connectSsh(Ctor: SshClientCtor, cfg: SshConfig, password = ''): Promise<SshClientLike> {
+/**
+ * Open one SSH connection and resolve once the handshake reports `ready`.
+ * An aborted `signal` ends the half-open connection, so a cancelled one-off
+ * (connection test) leaves nothing dialing in the background.
+ */
+export function connectSsh(Ctor: SshClientCtor, cfg: SshConfig, password = '', signal?: AbortSignal): Promise<SshClientLike> {
   return new Promise((resolve, reject) => {
     let options: Record<string, unknown>;
     try {
@@ -130,12 +183,15 @@ export function connectSsh(Ctor: SshClientCtor, cfg: SshConfig, password = ''): 
     }
     const client = new Ctor();
     let settled = false;
+    let offAbort: () => void = () => { /* attached below */ };
     const fail = (error: Error): void => {
       if (settled) return;
       settled = true;
+      offAbort();
       try { client.end(); } catch { /* the handshake never started */ }
       reject(error);
     };
+    offAbort = listenAbort(signal, () => fail(abortError('ssh connect cancelled')));
     client.on('error', (error) => {
       // ssh2 reports every rejected method with one generic sentence; name what
       // was actually attempted so a credential problem is distinguishable from
@@ -158,6 +214,7 @@ export function connectSsh(Ctor: SshClientCtor, cfg: SshConfig, password = ''): 
     client.on('ready', () => {
       if (settled) return;
       settled = true;
+      offAbort();
       resolve(client);
     });
     try {
@@ -169,16 +226,17 @@ export function connectSsh(Ctor: SshClientCtor, cfg: SshConfig, password = ''): 
 }
 
 /** Prove one target is reachable and authenticated, then disconnect. */
-export async function testConnection(cfg: SshConfig, password = ''): Promise<{ ok: boolean; message: string }> {
+export async function testConnection(cfg: SshConfig, password = '', signal?: AbortSignal): Promise<{ ok: boolean; message: string }> {
   const Ctor = await loadSsh2ClientCtor();
   if (!Ctor) return { ok: false, message: 'ssh2 不可用（插件目录缺少 node_modules，请先 pnpm install）' };
   const started = Date.now();
   try {
-    const client = await connectSsh(Ctor, cfg, password);
+    const client = await connectSsh(Ctor, cfg, password, signal);
     const identifying = `${cfg.username || process.env.USER || ''}@${cfg.host}:${cfg.port}`;
     client.end();
     return { ok: true, message: `已连通 ${identifying}（${Date.now() - started}ms）` };
   } catch (e) {
+    if (isAbortError(e)) throw e;
     return { ok: false, message: e instanceof Error ? e.message : String(e) };
   }
 }
@@ -199,48 +257,130 @@ export function withRemoteDir(command: string, remoteDir: string): string {
   return `cd ${shellQuote(remoteDir)} && ${command}`;
 }
 
-export function sshExec(client: SshClientLike, command: string, timeoutMs: number, remoteDir: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+/**
+ * Stop one running remote command: closing the channel alone leaves the remote
+ * process alive (sshd only hangs up pty sessions), so ask the server to forward
+ * SIGTERM first — RFC 4254 "signal" — and drop the channel right after.
+ */
+function stopStream(stream: SshStream | undefined): void {
+  if (!stream) return;
+  try { stream.signal?.('TERM'); } catch { /* server refused the request */ }
+  try { stream.close?.(); } catch { /* channel already gone */ }
+}
+
+/**
+ * Run one command over an existing connection.
+ * @param client - pooled SSH connection.
+ * @param command - command line.
+ * @param timeoutMs - local timeout for the whole call.
+ * @param remoteDir - directory to `cd` into first.
+ * @param signal - caller cancellation: aborting closes the channel, which
+ *   makes sshd hang up the remote command instead of letting it keep running.
+ */
+export function sshExec(client: SshClientLike, command: string, timeoutMs: number, remoteDir: string, signal?: AbortSignal): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortError());
     let settled = false;
-    const timer = setTimeout(() => {
+    let stream: SshStream | undefined;
+    let offAbort: () => void = () => { /* attached below */ };
+    // One exit point: clears the timeout, detaches the abort listener, then settles.
+    const finish = (settle: () => void): void => {
       if (settled) return;
       settled = true;
-      client.end();
-      reject(new Error(`ssh-exec timed out after ${timeoutMs}ms`));
+      clearTimeout(timer);
+      offAbort();
+      settle();
+    };
+    const timer = setTimeout(() => {
+      finish(() => {
+        client.end();
+        reject(new Error(`ssh-exec timed out after ${timeoutMs}ms`));
+      });
     }, timeoutMs);
-    client.exec(withRemoteDir(command, remoteDir), (err, stream) => {
-      if (err) { clearTimeout(timer); if (!settled) { settled = true; reject(err); } return; }
+    offAbort = listenAbort(signal, () => {
+      finish(() => {
+        stopStream(stream);
+        reject(abortError());
+      });
+    });
+    client.exec(withRemoteDir(command, remoteDir), (err, next) => {
+      if (err) return finish(() => reject(err));
+      stream = next;
+      // The cancel may have landed between `exec` and this callback: stop the
+      // channel we just acquired instead of leaving the command running.
+      if (settled) {
+        stopStream(next);
+        return;
+      }
       let stdout = '', stderr = '';
-      stream.on('data', (d) => { stdout += d.toString(); });
-      stream.stderr.on('data', (d) => { stderr += d.toString(); });
+      next.on('data', (d) => { stdout += d.toString(); });
+      next.stderr.on('data', (d) => { stderr += d.toString(); });
       // ssh2 streams close with an exit-code 'close' event carrying the code
-      stream.on('close', (code) => { clearTimeout(timer); if (settled) return; settled = true; resolve({ stdout, stderr, exitCode: code }); });
-      stream.on('error', (e) => { clearTimeout(timer); if (settled) return; settled = true; reject(e); });
+      next.on('close', (code) => finish(() => resolve({ stdout, stderr, exitCode: code })));
+      next.on('error', (e) => finish(() => reject(e)));
     });
   });
 }
 
-export function sshRead(client: SshClientLike, remotePath: string, remoteDir: string): Promise<{ content: string; path: string }> {
+export function sshRead(client: SshClientLike, remotePath: string, remoteDir: string, signal?: AbortSignal): Promise<{ content: string; path: string }> {
   const target = resolveRemotePath(remotePath, remoteDir);
   return new Promise((resolve, reject) => {
-    client.sftp((err, sftp) => {
-      if (err) return reject(err);
-      sftp.readFile(target, 'utf8', (err, content) => {
-        if (err) return reject(err);
-        resolve({ content: typeof content === 'string' ? content : content.toString('utf8'), path: target });
+    if (signal?.aborted) return reject(abortError());
+    let settled = false;
+    let sftp: SftpLike | undefined;
+    let offAbort: () => void = () => { /* attached below */ };
+    const finish = (settle: () => void): void => {
+      if (settled) return;
+      settled = true;
+      offAbort();
+      settle();
+    };
+    offAbort = listenAbort(signal, () => finish(() => {
+      try { sftp?.end?.(); } catch { /* session already gone */ }
+      reject(abortError());
+    }));
+    client.sftp((err, session) => {
+      if (err) return finish(() => reject(err));
+      sftp = session;
+      if (settled) {
+        try { session.end?.(); } catch { /* already closed */ }
+        return;
+      }
+      session.readFile(target, 'utf8', (readErr, content) => {
+        if (readErr) return finish(() => reject(readErr));
+        finish(() => resolve({ content: typeof content === 'string' ? content : content.toString('utf8'), path: target }));
       });
     });
   });
 }
 
-export function sshWrite(client: SshClientLike, remotePath: string, content: string, remoteDir: string): Promise<{ success: boolean; path: string }> {
+export function sshWrite(client: SshClientLike, remotePath: string, content: string, remoteDir: string, signal?: AbortSignal): Promise<{ success: boolean; path: string }> {
   const target = resolveRemotePath(remotePath, remoteDir);
   return new Promise((resolve, reject) => {
-    client.sftp((err, sftp) => {
-      if (err) return reject(err);
-      sftp.writeFile(target, content, (err) => {
-        if (err) return reject(err);
-        resolve({ success: true, path: target });
+    if (signal?.aborted) return reject(abortError());
+    let settled = false;
+    let sftp: SftpLike | undefined;
+    let offAbort: () => void = () => { /* attached below */ };
+    const finish = (settle: () => void): void => {
+      if (settled) return;
+      settled = true;
+      offAbort();
+      settle();
+    };
+    offAbort = listenAbort(signal, () => finish(() => {
+      try { sftp?.end?.(); } catch { /* session already gone */ }
+      reject(abortError());
+    }));
+    client.sftp((err, session) => {
+      if (err) return finish(() => reject(err));
+      sftp = session;
+      if (settled) {
+        try { session.end?.(); } catch { /* already closed */ }
+        return;
+      }
+      session.writeFile(target, content, (writeErr) => {
+        if (writeErr) return finish(() => reject(writeErr));
+        finish(() => resolve({ success: true, path: target }));
       });
     });
   });
@@ -283,12 +423,13 @@ function parentOf(path: string): string {
  * @param client - connected SSH client.
  * @param dir - directory to list; empty starts from `remoteDir`, then `$HOME`.
  * @param remoteDir - the target's configured working directory.
+ * @param signal - caller cancellation, forwarded to the underlying exec.
  * @returns the resolved path, its parent, and its entries (directories first).
  */
-export async function sshListDir(client: SshClientLike, dir: string, remoteDir: string): Promise<RemoteDirListing> {
+export async function sshListDir(client: SshClientLike, dir: string, remoteDir: string, signal?: AbortSignal): Promise<RemoteDirListing> {
   const start = dir.trim() !== '' ? dir : (remoteDir.trim() !== '' ? remoteDir : '$HOME');
   const script = `cd ${cdTarget(start)} 2>/dev/null || exit 9; printf '%s\\n' "$PWD"; ls -A1p`;
-  const { stdout, stderr, exitCode } = await sshExec(client, script, 15000, '');
+  const { stdout, stderr, exitCode } = await sshExec(client, script, 15000, '', signal);
   if (exitCode !== 0) {
     throw new Error(stderr.trim() || `无法进入目录 ${start}（exit ${exitCode}）`);
   }

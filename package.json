@@ -32,7 +32,8 @@
     "build": "tsdown && node scripts/copy-client.mjs",
     "build:tsc": "tsc -p tsconfig.build.json && node scripts/copy-client.mjs",
     "build:client": "node scripts/copy-client.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:client": "node scripts/test-client-flow.mjs"
   },
   "keywords": [
     "dsh",

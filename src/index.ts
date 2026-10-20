@@ -6,6 +6,8 @@ import { mkdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import {
   connectSsh,
+  isAbortError,
+  awaitWithSignal,
   loadSsh2ClientCtor,
   sshExec,
   sshListDir,
@@ -420,6 +422,16 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
   }
 
   /**
+   * The caller-owned cancellation signal DSH hands every tool body. Observing it
+   * is what makes the UI's 停止/取消 button actually stop the remote command
+   * instead of letting it run to its own timeout on the far side.
+   */
+  function execSignal(exec: unknown): AbortSignal | undefined {
+    const signal = (exec as { signal?: unknown } | undefined)?.signal;
+    return signal instanceof AbortSignal ? signal : undefined;
+  }
+
+  /**
    * Which connection a call uses: an explicit target, else the target bound to
    * the session's workspace, else the default, else the plugin config.
    */
@@ -441,17 +453,25 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
     return { key: 'config', label: `${resolved.ssh.host}:${resolved.ssh.port}`, config: resolved.ssh, store };
   }
 
-  async function withSshClient<T>(ref: string | undefined, cwd: string, run: (client: SshClientLike, cfg: SshConfig) => Promise<T>): Promise<T> {
+  async function withSshClient<T>(ref: string | undefined, cwd: string, run: (client: SshClientLike, cfg: SshConfig) => Promise<T>, signal?: AbortSignal): Promise<T> {
     const { key, config } = resolveTarget(ref, cwd);
-    return withSshConfig(config, key, (client) => run(client, config));
+    return withSshConfig(config, key, (client) => run(client, config), signal);
   }
 
-  /** Connect for an explicitly built configuration, reusing one connection per key. */
-  async function withSshConfig<T>(config: SshConfig, key: string, run: (client: SshClientLike) => Promise<T>): Promise<T> {
+  /**
+   * Connect for an explicitly built configuration, reusing one connection per key.
+   * A cancelled call stops waiting at once but leaves the pooled connection up:
+   * it is shared with every other call to the same target.
+   */
+  async function withSshConfig<T>(config: SshConfig, key: string, run: (client: SshClientLike) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const pending = (async () => connectionFor(key, config, await passwordFor(config)))();
+    const client = await awaitWithSignal(pending, signal);
     try {
-      return await run(await connectionFor(key, config, await passwordFor(config)));
+      return await run(client);
     } catch (error) {
-      dropConnection(key);
+      // A cancel is not a transport failure: never tear down a healthy shared
+      // connection just because one caller stopped waiting.
+      if (!isAbortError(error)) dropConnection(key);
       throw error;
     }
   }
@@ -579,7 +599,7 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
         },
         output: jsonOutput({ type: 'object', properties: { stdout: { type: 'string' }, stderr: { type: 'string' }, exitCode: { type: 'number' } } }),
         execute: (args: { command: string; timeoutMs?: number; target?: string }, exec: unknown) =>
-          withSshClient(args.target, sessionCwd(exec), (c, cfg) => sshExec(c, args.command, args.timeoutMs ?? 30000, cfg.remoteDir)),
+          withSshClient(args.target, sessionCwd(exec), (c, cfg) => sshExec(c, args.command, args.timeoutMs ?? 30000, cfg.remoteDir, execSignal(exec)), execSignal(exec)),
       })));
 
       disposers.push(agent.ctx.tools.register(defineTool({
@@ -596,7 +616,7 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
         },
         output: jsonOutput({ type: 'object', properties: { content: { type: 'string' }, path: { type: 'string' } } }),
         execute: (args: { path: string; target?: string }, exec: unknown) =>
-          withSshClient(args.target, sessionCwd(exec), (c, cfg) => sshRead(c, args.path, cfg.remoteDir)),
+          withSshClient(args.target, sessionCwd(exec), (c, cfg) => sshRead(c, args.path, cfg.remoteDir, execSignal(exec)), execSignal(exec)),
       })));
 
       disposers.push(agent.ctx.tools.register(defineTool({
@@ -614,7 +634,7 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
         },
         output: jsonOutput({ type: 'object', properties: { success: { type: 'boolean' }, path: { type: 'string' } } }),
         execute: (args: { path: string; content: string; target?: string }, exec: unknown) =>
-          withSshClient(args.target, sessionCwd(exec), (c, cfg) => sshWrite(c, args.path, args.content, cfg.remoteDir)),
+          withSshClient(args.target, sessionCwd(exec), (c, cfg) => sshWrite(c, args.path, args.content, cfg.remoteDir, execSignal(exec)), execSignal(exec)),
       })));
 
       disposers.push(agent.ctx.tools.register(defineTool({
@@ -639,8 +659,8 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
           additionalProperties: false,
         },
         output: jsonOutput({ type: 'object', properties: { ok: { type: 'boolean' }, message: { type: 'string' } } }),
-        execute: async (args: Record<string, unknown>) => {
-          const result = await sshTargetsAction(args as never);
+        execute: async (args: Record<string, unknown>, exec: unknown) => {
+          const result = await sshTargetsAction(args as never, execSignal(exec));
           const revealed = (result as { password?: string; ref?: string; source?: string }).password;
           const revealLine = revealed ? [`密码（${(result as { ref?: string }).ref}，来源：${(result as { source?: string }).source}）：${revealed}`] : [];
           const store = loadStore();
@@ -665,7 +685,7 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
   }
 
   /** Shared by the `ssh-targets` tool and the Remote UI routes. */
-  async function sshTargetsAction(input: TargetInput & { action?: string; password?: string; storePassword?: boolean }) {
+  async function sshTargetsAction(input: TargetInput & { action?: string; password?: string; storePassword?: boolean }, signal?: AbortSignal) {
     const action = (input.action ?? 'list').trim();
     const store = loadStore();
     if (action === 'list') {
@@ -686,11 +706,11 @@ export function apply(ctx: HostContextLike, config: ConfigSchema = {}): void {
       const cfg = overrideConfig(base, input);
       const key = target ? `target:${target.id}` : `cfg:${cfg.host}:${cfg.port}:${cfg.username}`;
       if (action === 'test') {
-        const result = await testConnection(cfg, await passwordFor(cfg));
+        const result = await testConnection(cfg, await passwordFor(cfg), signal);
         return { ok: result.ok, message: result.message, targets: await describeAll(store), defaultId: store.defaultId };
       }
       const path = typeof (input as { path?: string }).path === 'string' ? String((input as { path?: string }).path) : '';
-      const listing = await withSshConfig(cfg, key, (client) => sshListDir(client, path, cfg.remoteDir));
+      const listing = await withSshConfig(cfg, key, (client) => sshListDir(client, path, cfg.remoteDir, signal), signal);
       return { ok: true, message: listing.path, listing, targets: await describeAll(store), defaultId: store.defaultId };
     }
     if (action === 'prepareDir') {
